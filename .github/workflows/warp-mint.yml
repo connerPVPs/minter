@@ -1,0 +1,204 @@
+name: WARP IP Mint & Uniqueness Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Number of parallel jobs"
+        required: true
+        default: "20"
+        type: choice
+        options:
+          - "5"
+          - "10"
+          - "15"
+          - "20"
+      per_job:
+        description: "Registrations per job"
+        required: true
+        default: "5"
+        type: choice
+        options:
+          - "3"
+          - "5"
+          - "8"
+          - "10"
+
+jobs:
+  mint:
+    name: Mint Job ${{ matrix.job }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        job: ${{ fromJSON(format('[{0}]', join(fromJSON(format('range(1, {0})', inputs.jobs || 20)), ','))) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+          sudo systemctl enable --now warp-svc || true
+          sleep 3
+
+      - name: Mint WARP registrations
+        id: mint
+        run: |
+          set +e
+          PER_JOB=${{ inputs.per_job || 5 }}
+          RESULTS_FILE="results-job-${{ matrix.job }}.json"
+          echo "[]" > "$RESULTS_FILE"
+
+          for i in $(seq 1 $PER_JOB); do
+            echo "=== Registration $i / $PER_JOB (Job ${{ matrix.job }}) ==="
+
+            # Clean previous registration
+            sudo warp-cli --accept-tos disconnect 2>/dev/null || true
+            sudo warp-cli --accept-tos registration delete 2>/dev/null || true
+            sleep 1
+
+            # New registration
+            REG_OUT=$(sudo warp-cli --accept-tos registration new 2>&1)
+            echo "Registration output: $REG_OUT"
+
+            # Connect
+            sudo warp-cli --accept-tos connect
+            sleep 4
+
+            # Get public IPv4
+            IPV4=$(curl -s --max-time 8 https://ipv4.icanhazip.com || curl -s --max-time 8 https://api.ipify.org || echo "FAILED")
+            IPV6=$(curl -s --max-time 8 https://ipv6.icanhazip.com || echo "none")
+
+            # Get WARP status
+            STATUS=$(sudo warp-cli --accept-tos status 2>&1 | head -5 | tr '\n' ' ')
+
+            # Get registration info
+            REG_INFO=$(sudo warp-cli --accept-tos registration show 2>&1 | tr '\n' ' ' | head -c 300)
+
+            # Append to results
+            jq --arg ip "$IPV4" \
+               --arg ipv6 "$IPV6" \
+               --arg status "$STATUS" \
+               --arg reg "$REG_INFO" \
+               --arg job "${{ matrix.job }}" \
+               --arg idx "$i" \
+               '. += [{
+                 "job": ($job|tonumber),
+                 "index": ($idx|tonumber),
+                 "ipv4": $ip,
+                 "ipv6": $ipv6,
+                 "status": $status,
+                 "registration": $reg,
+                 "timestamp": (now|todate)
+               }]' "$RESULTS_FILE" > tmp.json && mv tmp.json "$RESULTS_FILE"
+
+            echo "Got IPv4: $IPV4"
+
+            # Small delay between registrations
+            sleep 2
+          done
+
+          echo "Results for job ${{ matrix.job }}:"
+          cat "$RESULTS_FILE"
+
+      - name: Upload job results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-job-${{ matrix.job }}
+          path: results-job-${{ matrix.job }}.json
+          retention-days: 5
+
+  analyze:
+    name: Analyze All Results
+    needs: mint
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+          pattern: results-job-*
+          merge-multiple: true
+
+      - name: Generate full report
+        run: |
+          echo "=============================================="
+          echo "       WARP IP UNIQUENESS REPORT"
+          echo "=============================================="
+          echo ""
+
+          # Combine all JSON files
+          jq -s 'add' all-results/*.json > combined.json 2>/dev/null || echo "[]" > combined.json
+
+          TOTAL=$(jq 'length' combined.json)
+          UNIQUE_IPV4=$(jq '[.[].ipv4] | unique | length' combined.json)
+          FAILED=$(jq '[.[] | select(.ipv4 == "FAILED" or .ipv4 == "")] | length' combined.json)
+          SUCCESS=$((TOTAL - FAILED))
+
+          echo "Total registration attempts : $TOTAL"
+          echo "Successful (got IPv4)       : $SUCCESS"
+          echo "Failed                     : $FAILED"
+          echo "Unique IPv4 addresses      : $UNIQUE_IPV4"
+          echo ""
+
+          if [ "$SUCCESS" -gt 0 ]; then
+            UNIQUE_RATIO=$(echo "scale=1; $UNIQUE_IPV4 * 100 / $SUCCESS" | bc)
+            echo "Uniqueness ratio           : ${UNIQUE_RATIO}%"
+          fi
+
+          echo ""
+          echo "---------- All IPv4 addresses found ----------"
+          jq -r '.[].ipv4' combined.json | sort | uniq -c | sort -nr
+
+          echo ""
+          echo "---------- Duplicate IPv4s (if any) ----------"
+          jq -r '.[].ipv4' combined.json | sort | uniq -c | awk '$1 > 1 {print $1, "times →", $2}'
+
+          echo ""
+          echo "---------- Full detailed list ----------"
+          jq -r '.[] | "Job \(.job)-\(.index) | \(.ipv4) | \(.ipv6)"' combined.json
+
+          echo ""
+          echo "=============================================="
+          echo "Summary saved to summary.md"
+          echo "=============================================="
+
+          # Create markdown summary
+          {
+            echo "# WARP Mint Results"
+            echo ""
+            echo "- **Total attempts**: $TOTAL"
+            echo "- **Successful**: $SUCCESS"
+            echo "- **Failed**: $FAILED"
+            echo "- **Unique IPv4s**: $UNIQUE_IPV4"
+            echo ""
+            echo "## IPv4 Frequency"
+            echo '```'
+            jq -r '.[].ipv4' combined.json | sort | uniq -c | sort -nr
+            echo '```'
+            echo ""
+            echo "## Detailed List"
+            echo "| Job | Index | IPv4 | IPv6 |"
+            echo "|-----|-------|------|------|"
+            jq -r '.[] | "| \(.job) | \(.index) | \(.ipv4) | \(.ipv6) |"' combined.json
+          } > summary.md
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-report
+          path: |
+            combined.json
+            summary.md
+          retention-days: 7
+
+      - name: Print summary in logs
+        run: cat summary.md
