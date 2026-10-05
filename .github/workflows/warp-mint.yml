@@ -1,13 +1,8 @@
-name: WARP IPv6 OpenCode Test
+name: WARP IPv6 OpenCode Test v2
 
 on:
   workflow_dispatch:
     inputs:
-      jobs:
-        description: "Number of parallel jobs"
-        required: true
-        default: "10"
-        type: string
       regs_per_job:
         description: "Registrations per job"
         required: true
@@ -20,8 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        job_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # change this list or use dynamic matrix later
-        # For larger runs you can expand this list up to \~20-40 easily
+        job_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
     steps:
       - name: Install Cloudflare WARP
@@ -29,12 +23,11 @@ jobs:
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
+          sudo apt-get install -y cloudflare-warp jq
           sudo systemctl enable --now warp-svc || true
-          sleep 3
+          sleep 4
 
       - name: Run registrations + OpenCode tests
-        id: test
         run: |
           set +e
           RESULTS_FILE="results-job-${{ matrix.job_id }}.json"
@@ -43,53 +36,51 @@ jobs:
           REGS=${{ github.event.inputs.regs_per_job || 2 }}
 
           for i in $(seq 1 $REGS); do
-            echo "=== Job ${{ matrix.job_id }} | Registration $i ==="
+            echo "=============================================="
+            echo "Job ${{ matrix.job_id }} | Registration $i"
+            echo "=============================================="
 
-            # Clean previous registration
             sudo warp-cli registration delete 2>/dev/null || true
             sleep 1
-
-            # New registration
             sudo warp-cli registration new
             sleep 2
-
-            # Connect
             sudo warp-cli connect
-            sleep 4
+            sleep 5
 
-            # Get public IPs (prefer IPv6)
-            IPV4=$(curl -4 -s --max-time 8 https://api.ipify.org || curl -4 -s --max-time 8 https://ifconfig.co || echo "none")
-            IPV6=$(curl -6 -s --max-time 8 https://api64.ipify.org || curl -6 -s --max-time 8 https://ifconfig.co || echo "none")
+            # Better IP detection
+            IPV4=$(curl -4 -s --max-time 10 https://api.ipify.org || curl -4 -s --max-time 8 https://ifconfig.me || echo "none")
+            IPV6=$(curl -6 -s --max-time 10 https://api64.ipify.org || curl -6 -s --max-time 8 https://ifconfig.co || echo "none")
 
-            echo "IPv4: $IPV4"
-            echo "IPv6: $IPV6"
+            echo "Public IPv4 → $IPV4"
+            echo "Public IPv6 → $IPV6"
 
-            # Generate a fake but valid-looking session id
+            # Generate session
             SESSION="ses_\( (openssl rand -hex 6) \)(openssl rand -hex 7)"
 
-            # Minimal valid OpenCode Zen free-tier request
-            HTTP_CODE=$(curl -s -o /tmp/oc_response.txt -w "%{http_code}" \
-              --max-time 20 \
+            # Improved request (closer to real OpenCode client)
+            HTTP_CODE=$(curl -s -o /tmp/oc_body.txt -w "%{http_code}" \
+              --max-time 25 \
               -X POST "https://opencode.ai/zen/v1/chat/completions" \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer public" \
               -H "User-Agent: opencode/1.18.18" \
               -H "x-opencode-session: $SESSION" \
+              -H "x-opencode-client: cli" \
+              -H "Accept: text/event-stream" \
               -d '{
                 "model": "big-pickle",
                 "stream": true,
-                "messages": [{"role": "user", "content": "ping"}],
+                "messages": [{"role": "user", "content": "Say hi"}],
                 "tools": [
-                  {"type": "function", "function": {"name": "bash"}},
-                  {"type": "function", "function": {"name": "glob"}},
-                  {"type": "function", "function": {"name": "grep"}},
-                  {"type": "function", "function": {"name": "read"}}
+                  {"type": "function", "function": {"name": "bash", "description": "Run bash"}},
+                  {"type": "function", "function": {"name": "glob", "description": "Glob files"}},
+                  {"type": "function", "function": {"name": "grep", "description": "Grep files"}},
+                  {"type": "function", "function": {"name": "read", "description": "Read file"}}
                 ]
               }' || echo "000")
 
-            BODY=$(head -c 300 /tmp/oc_response.txt | tr '\n' ' ' | sed 's/"/\\"/g')
+            BODY=$(cat /tmp/oc_body.txt | head -c 500 | tr '\n' ' ' | sed 's/"/\\"/g')
 
-            # Determine result status
             if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
               STATUS="OK"
             elif [ "$HTTP_CODE" = "429" ]; then
@@ -100,32 +91,35 @@ jobs:
               STATUS="ERROR"
             fi
 
-            echo "HTTP $HTTP_CODE → $STATUS"
+            echo "HTTP Code  → $HTTP_CODE ($STATUS)"
+            echo "Response   → $BODY"
+            echo ""
 
-            # Append result
-            jq --arg job "${{ matrix.job_id }}" \
-               --arg idx "$i" \
-               --arg ipv4 "$IPV4" \
-               --arg ipv6 "$IPV6" \
-               --arg code "$HTTP_CODE" \
-               --arg status "$STATUS" \
-               --arg body "$BODY" \
-               '. += [{
-                 job: $job,
-                 index: ($idx|tonumber),
-                 ipv4: $ipv4,
-                 ipv6: $ipv6,
-                 http_code: $code,
-                 status: $status,
-                 response_snippet: $body
-               }]' "$RESULTS_FILE" > tmp.json && mv tmp.json "$RESULTS_FILE"
+            jq -n \
+              --arg job "${{ matrix.job_id }}" \
+              --arg idx "$i" \
+              --arg ipv4 "$IPV4" \
+              --arg ipv6 "$IPV6" \
+              --arg code "$HTTP_CODE" \
+              --arg status "$STATUS" \
+              --arg body "$BODY" \
+              '{
+                job: $job,
+                index: ($idx|tonumber),
+                ipv4: $ipv4,
+                ipv6: $ipv6,
+                http_code: $code,
+                status: $status,
+                response: $body
+              }' > /tmp/entry.json
 
-            # Disconnect for next cycle
+            jq -s '.[0] + [.[1]]' "$RESULTS_FILE" /tmp/entry.json > tmp.json && mv tmp.json "$RESULTS_FILE"
+
             sudo warp-cli disconnect 2>/dev/null || true
             sleep 2
           done
 
-          echo "Results saved to $RESULTS_FILE"
+          echo "Final results for this job:"
           cat "$RESULTS_FILE"
 
       - name: Upload results
@@ -133,14 +127,12 @@ jobs:
         with:
           name: results-job-${{ matrix.job_id }}
           path: results-job-${{ matrix.job_id }}.json
-          if-no-files-found: warn
 
   analyze:
     needs: mint-and-test
     runs-on: ubuntu-latest
     steps:
-      - name: Download all results
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: all-results
           pattern: results-job-*
@@ -148,58 +140,32 @@ jobs:
 
       - name: Analyze
         run: |
-          echo "=============================================="
-          echo "       WARP IPv6 + OpenCode Test Report"
-          echo "=============================================="
-
-          # Combine everything
           jq -s 'add' all-results/*.json > combined.json || echo "[]" > combined.json
+
+          echo "=============================================="
+          echo "       FINAL REPORT"
+          echo "=============================================="
 
           TOTAL=$(jq 'length' combined.json)
           SUCCESS=$(jq '[.[] | select(.status=="OK")] | length' combined.json)
-          RATE_LIMITED=$(jq '[.[] | select(.status=="RATE_LIMITED")] | length' combined.json)
+          RATE=$(jq '[.[] | select(.status=="RATE_LIMITED")] | length' combined.json)
           FORBIDDEN=$(jq '[.[] | select(.status=="FORBIDDEN")] | length' combined.json)
           ERRORS=$(jq '[.[] | select(.status=="ERROR")] | length' combined.json)
+          UNIQUE_V6=$(jq -r '.[].ipv6' combined.json | grep -v none | sort -u | wc -l)
+          UNIQUE_V4=$(jq -r '.[].ipv4' combined.json | grep -v none | sort -u | wc -l)
 
-          UNIQUE_IPV6=$(jq -r '.[].ipv6' combined.json | grep -v none | sort -u | wc -l)
-          UNIQUE_IPV4=$(jq -r '.[].ipv4' combined.json | grep -v none | sort -u | wc -l)
-
-          echo "Total attempts          : $TOTAL"
-          echo "Successful (200/201)    : $SUCCESS"
-          echo "Rate limited (429)      : $RATE_LIMITED"
-          echo "Forbidden (403)         : $FORBIDDEN"
-          echo "Other errors            : $ERRORS"
+          echo "Total attempts       : $TOTAL"
+          echo "Successful           : $SUCCESS"
+          echo "Rate Limited (429)   : $RATE"
+          echo "Forbidden (403)      : $FORBIDDEN"
+          echo "Other errors         : $ERRORS"
+          echo "Unique IPv6          : $UNIQUE_V6"
+          echo "Unique IPv4          : $UNIQUE_V4"
           echo ""
-          echo "Unique IPv6 addresses   : $UNIQUE_IPV6"
-          echo "Unique IPv4 addresses   : $UNIQUE_IPV4"
-          echo ""
+          echo "=== Sample Responses (first 5) ==="
+          jq -r '.[0:5][] | "Job \(.job)#\(.index) → \(.status) | IPv6: \(.ipv6)\nResponse: \(.response)\n"' combined.json
 
-          echo "=== IPv6 Frequency ==="
-          jq -r '.[].ipv6' combined.json | grep -v none | sort | uniq -c | sort -nr
-
-          echo ""
-          echo "=== Detailed Results ==="
-          jq -r '.[] | "Job \(.job) #\(.index) | IPv6: \(.ipv6) | HTTP \(.http_code) → \(.status)"' combined.json
-
-          # Save summary
-          cat > summary.md << EOF
-          # WARP IPv6 OpenCode Test Summary
-
-          - **Total attempts**: $TOTAL
-          - **Successful**: $SUCCESS
-          - **Rate Limited (429)**: $RATE_LIMITED
-          - **Forbidden (403)**: $FORBIDDEN
-          - **Other errors**: $ERRORS
-          - **Unique IPv6s**: $UNIQUE_IPV6
-          - **Unique IPv4s**: $UNIQUE_IPV4
-          EOF
-
-          cat summary.md
-
-      - name: Upload full report
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: full-report
-          path: |
-            combined.json
-            summary.md
+          path: combined.json
